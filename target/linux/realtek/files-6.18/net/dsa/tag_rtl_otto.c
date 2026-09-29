@@ -24,10 +24,24 @@ static struct sk_buff *rtl_otto_xmit(struct sk_buff *skb, struct net_device *dev
 	return skb;
 }
 
+/* Only frames the switch trapped to the CPU get here, see rteth_add_trailer() */
 static struct sk_buff *rtl_otto_rcv(struct sk_buff *skb, struct net_device *dev)
 {
-	/* RX path uses METADATA_HW_PORT_MUX. This function just makes netdev_uses_dsa() happy. */
-	netdev_err(dev, "ethernet driver did not set METADATA\n");
+	u8 *trailer;
+
+	if (skb_linearize(skb))
+		return NULL;
+
+	trailer = skb_tail_pointer(skb) - RTL_OTTO_TAILROOM;
+	if (trailer[1] != 0xab || trailer[2] != 0xcd || trailer[3] != 0xef)
+		return NULL;
+
+	skb->dev = dsa_conduit_find_user(dev, 0, trailer[0]);
+	if (!skb->dev)
+		return NULL;
+
+	if (pskb_trim_rcsum(skb, skb->len - RTL_OTTO_TAILROOM))
+		return NULL;
 
 	return skb;
 }

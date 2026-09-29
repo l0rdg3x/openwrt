@@ -1168,7 +1168,29 @@ static int rteth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	return NETDEV_TX_OK;
 }
 
-static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int slot)
+/*
+ * The DSA core marks every frame it receives through METADATA_HW_PORT_MUX as forwarded in
+ * hardware (dsa_default_offload_fwd_mark()), so a frame the switch only trapped to the CPU
+ * goes to the tagger instead, with its source port in a trailer written over the FCS.
+ */
+static int rteth_add_trailer(struct sk_buff *skb, unsigned int port)
+{
+	u8 *trailer;
+
+	if (skb_linearize(skb))
+		return -ENOMEM;
+
+	trailer = skb_tail_pointer(skb) - ETH_FCS_LEN;
+	trailer[0] = port;
+	trailer[1] = 0xab;
+	trailer[2] = 0xcd;
+	trailer[3] = 0xef;
+
+	return 0;
+}
+
+/* trap_port: source port of a frame the switch trapped to the CPU, -1 if it forwarded it */
+static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int slot, int *trap_port)
 {
 	struct rteth_frag *frag = &ctrl->rx_data[ring].frag[slot];
 	unsigned int offset = ctrl->rx_info[ring].offset[slot];
@@ -1191,11 +1213,15 @@ static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int s
 	skb_put(skb, len);
 
 	ctrl->cfg->decode_tag(frag, &tag);
+	*trap_port = -1;
 	if (netdev_uses_dsa(dev)) {
-		if (tag.port < ctrl->cfg->cpu_port)
-			skb_dst_set_noref(skb, &ctrl->dsa_meta[tag.port]->dst);
-		if (tag.l2_offloaded)
+		if (!tag.l2_offloaded && tag.port < ctrl->cfg->cpu_port) {
+			*trap_port = tag.port;
+		} else {
+			if (tag.port < ctrl->cfg->cpu_port)
+				skb_dst_set_noref(skb, &ctrl->dsa_meta[tag.port]->dst);
 			skb->offload_fwd_mark = 1;
+		}
 	}
 
 	if (dev->features & NETIF_F_RXCSUM) {
@@ -1232,6 +1258,7 @@ static int rteth_append_skb(struct sk_buff *skb, struct rteth_ctrl *ctrl, int ri
 static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 {
 	int slot, work_done = 0, rx_packets = 0, rx_bytes = 0, rx_dropped = 0, rx_errors = 0;
+	int trap_port = -1;
 	struct rteth_ctrl *ctrl = netdev_priv(dev);
 	struct rteth_rx_info *rx_info = &ctrl->rx_info[ring];
 	unsigned int len, new_offset;
@@ -1282,7 +1309,7 @@ static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 		}
 
 		if (is_head) {
-			skb = rteth_create_skb(ctrl, ring, slot);
+			skb = rteth_create_skb(ctrl, ring, slot, &trap_port);
 			if (unlikely(!skb)) {
 				netdev_err(dev, "skb creation failed\n");
 				rx_dropped++;
@@ -1297,8 +1324,11 @@ static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 		if (is_tail && skb) {
 			if (unlikely(skb->len < ETH_HLEN + ETH_FCS_LEN)) {
 				rx_errors += rteth_free_skb(&skb);
+			} else if (trap_port >= 0 && unlikely(rteth_add_trailer(skb, trap_port))) {
+				rx_dropped += rteth_free_skb(&skb);
 			} else {
-				pskb_trim(skb, skb->len - ETH_FCS_LEN);
+				if (trap_port < 0)
+					pskb_trim(skb, skb->len - ETH_FCS_LEN);
 				rx_bytes += skb->len;
 				rx_packets++;
 				skb->protocol = eth_type_trans(skb, dev);
